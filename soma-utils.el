@@ -1,7 +1,35 @@
-;;; -*- lexical-binding: t -*-
+;;; soma-utils.el --- Utility functions used throughout the configuration  -*- lexical-binding: t -*-
 
-;; For cl-case:
-(require 'cl-macs)
+;; Package-Requires: ((emacs "27.1") (s "0") (evil "0"))
+
+;; For cl-case, cl-assert, cl-first, cl-remove-if and friends:
+(require 'cl-lib)
+
+;; evil is a declared dependency (see Package-Requires above).  It is required
+;; at run time as well as compile time: evil-with-single-undo is a macro that
+;; must be known when this file is byte-compiled, and its expansion and several
+;; other functions in this file call evil functions at run time:
+(require 'evil)
+
+;; Built-in libraries used below: string-remove-prefix (a defsubst) and
+;; url-type (a cl-defstruct accessor):
+(require 'subr-x)
+(require 'url-parse)
+
+;; Functions defined in other packages or in init files.  Declared so the
+;; byte-compiler knows they exist; they are not loaded here.
+(declare-function calc-enter-result "calc")
+(declare-function math-read-expr "calc-ext")
+(declare-function ivy-read "ivy")
+(declare-function counsel--find-file-matcher "counsel")
+(declare-function org-table-convert-region "org-table")
+(declare-function org-table-hline-and-move "org-table")
+(declare-function get-clipboard-contents "soma-get-clipboard-contents-init")
+(declare-function xclip-set-selection "xclip")
+(declare-function pbcopy-set-selection "soma-pbcopy-init")
+
+;; Defined by recentf; soma-purge-recentf reads and assigns it:
+(defvar recentf-list)
 
 ;;------------------------------------------------------------------------
 ;;
@@ -16,28 +44,15 @@
 (defun soma-delete-trailing-whitespace-except-on-current-line ()
   (interactive)
   (save-excursion
-    (let ((starting-position (point)))
-      ; See if there are any lines before the starting position.
-      (ignore-errors
-        (previous-line))
-      (unless (eq (point) starting-position)
-        ; There were some lines before the starting position.
-        ; Delete trailing whitespace on all lines before the starting position:
-        (progn
-          (end-of-line)
-          (delete-trailing-whitespace (point-min) (point))))))
-  ; Back to the starting position
-  (save-excursion
-    (let ((starting-position (point)))
-      ; See if there are any lines after the starting position.
-      (ignore-errors
-        (next-line))
-      (unless (eq (point) starting-position)
-        ; There were some lines after the starting position.
-        ; Delete trailing whitespace on all lines after the starting position:
-        (progn
-          (beginning-of-line)
-          (delete-trailing-whitespace (point) (point-max)))))))
+    ;; Delete trailing whitespace on all lines after the current line,
+    ;; if there are any.  This goes first so that the line positions
+    ;; used below are not shifted.
+    (when (< (line-end-position) (point-max))
+      (delete-trailing-whitespace (1+ (line-end-position)) (point-max)))
+    ;; Delete trailing whitespace on all lines before the current line,
+    ;; if there are any:
+    (when (> (line-beginning-position) (point-min))
+      (delete-trailing-whitespace (point-min) (line-beginning-position)))))
 ;;
 ;;------------------------------------------------------------------------
 
@@ -68,6 +83,12 @@
 ;;------------------------------------------------------------------------
 ;;
 
+;; counsel.el defines this variable, and soma--choose-directory binds it, but
+;; counsel is not loaded when this file is byte-compiled.  Declare it special
+;; here so that the let binding below stays dynamic in the compiled code and
+;; counsel--find-file-matcher can see it:
+(defvar counsel--find-file-predicate)
+
 (defun soma--choose-directory (directory-to-start-in)
   "Return a directory chosen by the user.  THe user will be prompted
 to choose a directory starting with `directory-to-start-in'"
@@ -94,10 +115,12 @@ Otherwise, returns its parent directory."
   (pcase file-or-directory
     ('nil nil)
     ((pred file-exists-p) file-or-directory)
-    (and
-     (guard (stringp file-or-directory))
+    ((guard (stringp file-or-directory))
+     ;; soma--parent-directory returns nil when there is no parent, so
+     ;; stop (and return nil) rather than calling file-exists-p on nil:
      (cl-loop
-      while (not (file-exists-p file-or-directory))
+      while (and file-or-directory
+                 (not (file-exists-p file-or-directory)))
       do (setq file-or-directory
                (soma--parent-directory file-or-directory))
       finally return file-or-directory))))
@@ -111,7 +134,7 @@ Otherwise, returns its parent directory."
 (defun soma--escape-string (s)
   "Escape % in string, by quadrupling the %.
 Not sure why simply doubling it doesn't work, but merely doubling
-it leads a 'Not enough arguments for format string' error"
+it leads a \"Not enough arguments for format string\" error"
   (cl-assert (stringp s))
   ;; Not sure why escaping with just %% doesn't work
   (replace-regexp-in-string "%" "%%%%" s))
@@ -128,25 +151,6 @@ it leads a 'Not enough arguments for format string' error"
   (let ((escaped-s
          (soma--escape-string s)))
     (soma--truncate-with-elipsis-if-over-length escaped-s 72)))
-
-;;
-;;------------------------------------------------------------------------
-
-;;------------------------------------------------------------------------
-;;
-;; Note: This is currently not working, possibly because
-;;       geiser-debug--send-region, the function it was modeled on,
-;;       might be broken too.  It's hard to tell.  I'm getting
-;;       "unbound variable: geiser#geiser-eval" errors, and I'm not
-;;       sure why
-
-(defun soma--geiser--send-string (str)
-  (let* ((wrapped (geiser-debug--wrap-region str))
-         (code `(:eval (:scm ,wrapped)))
-         (ret (geiser-eval--send/wait code))
-         (res (geiser-eval--retort-result-str ret nil))
-         (err (geiser-eval--retort-error ret)))
-    ret))
 
 ;;
 ;;------------------------------------------------------------------------
@@ -260,7 +264,7 @@ then add elipsis"
 (defun soma--get-from-x-or-kill-ring (from)
   "Returns contents of X primary selection or the top
 of the emacs kill ring, depending on whether `from'
-is 'emacs or 'x"
+is `emacs' or `x'"
   (let ((result
          (cl-case from
            (emacs
@@ -270,9 +274,9 @@ is 'emacs or 'x"
             (soma-utils-chomp
              (get-clipboard-contents)))
            (otherwise
-            (error "soma--get-from-x-or-kill-ring: Error: "
-                   "Invalid argument %s\n"
-                   "Valid arguments are 'emacs or 'x"
+            (error (concat "soma--get-from-x-or-kill-ring: Error: "
+                           "Invalid argument %s\n"
+                           "Valid arguments are 'emacs or 'x")
                    from)))))
     result))
 
@@ -372,7 +376,7 @@ Note: The region to be read must include an outer set of double quotes."
 ;; which it calls, but it also call a function to guess
 ;; the format string, and it's done it will position point
 ;; at the first number it inserted.
-(defun soma-rectangle-number-lines-alt(start end start-at &optional format format-guesser)
+(defun soma-rectangle-number-lines-alt(start end start-at &optional format _format-guesser)
   "Insert numbers in front of the region-rectangle.
 
 START-AT, if non-nil, should be a number from which to begin
@@ -457,10 +461,7 @@ in a region."
   (evil-exit-visual-state)
   (let ((left-most-col-with-non-whitespace-char 10000000000000))
     (save-excursion
-      (let ((non-blank-character "[^ ]")
-            (bound nil)
-            (no-error t)
-            (start-of-line-at-region-beg
+      (let ((start-of-line-at-region-beg
              (progn
                (goto-char beg)
                (forward-line 0)
@@ -586,15 +587,17 @@ For example,
   (cl-assert (integerp end))
   (cl-assert (>= start 0))
   (cl-assert (<= end (point-max)))
-  (let* ((temp-buffer-name-prefix " soma-utils-pp-region-temp")
-         (temp-buffer-name (generate-new-buffer-name temp-buffer-name-prefix))
-         (temp-buffer (generate-new-buffer temp-buffer-name)))
-    (append-to-buffer temp-buffer start end)
-    (with-current-buffer temp-buffer
-      (pp-buffer))
+  (let ((pretty-printed
+         (let ((text (buffer-substring start end)))
+           ;; with-temp-buffer kills the buffer even if pp-buffer signals.
+           (with-temp-buffer
+             (insert text)
+             (pp-buffer)
+             (buffer-string)))))
     (delete-region start end)
-    (insert-buffer temp-buffer)
-    (kill-buffer temp-buffer)))
+    (save-excursion
+      (goto-char start)
+      (insert pretty-printed))))
 ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -602,11 +605,11 @@ For example,
 ;;
 (defun soma-utils-pp-region-interactive (start end)
   "Replace the selected region with a pretty-printed copy of it"
+  (interactive "r")
   (cl-assert (integerp start))
   (cl-assert (integerp end))
   (cl-assert (>= start 0))
   (cl-assert (<= end (point-max)))
-  (interactive "r")
   (soma-utils-pp-region start end))
 ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -637,8 +640,8 @@ For example,
 ;;
 (defun soma-point-on-empty-line? ()
   (equal
-   (point-at-eol)
-   (point-at-bol)))
+   (line-end-position)
+   (line-beginning-position)))
 ;;
 ;;------------------------------------------------------------------------
 
@@ -718,15 +721,13 @@ For example,
           ;; so we want to use the native emacs clipboard sending feature instead.
           (if (display-graphic-p)
               ;; We are running in a gui emacs.
-              ;; Temporarily save the value of x-select-enable-clipboard,
-              ;; and restore it after using the native emacs clipboard sending
-              ;; feature.
-              (let ((old-x-select-enable-clipboard x-select-enable-clipboard))
-                (setf x-select-enable-clipboard 't)
+              ;; Temporarily enable select-enable-clipboard so that the native
+              ;; emacs clipboard sending feature is used.  The let binding
+              ;; restores the old value even if evil-yank signals an error.
+              (let ((select-enable-clipboard t))
                 (evil-yank evil-visual-beginning
                            evil-visual-end
-                           (evil-visual-type))
-                (setf x-select-enable-clipboard old-x-select-enable-clipboard))
+                           (evil-visual-type)))
             ;; We are *not* running in a gui emacs.
             (progn
               (shell-command-on-region (region-beginning) (region-end)
@@ -787,9 +788,12 @@ For example,
 (defun soma-current-local-map-name ()
   "Print the name of the current-local-map."
   (interactive)
-  (let ((current-local-map-name
-         (first (find-variable-name (current-local-map)))))
-    (print current-local-map-name)))
+  (let ((map (current-local-map)))
+    ;; Without a local map, (current-local-map) is nil, and
+    ;; soma-find-variable-name would return every variable whose value is nil.
+    (if map
+        (print (cl-first (soma-find-variable-name map)))
+      (message "No local map in this buffer"))))
 ;;
 ;;------------------------------------------------------------------------
 
@@ -818,9 +822,9 @@ might be bad."
   "Perform a bunch of operations on the whitespace content of a buffer.
 Including indent-buffer, which should not be called automatically on save."
   (interactive)
-  (untabify-buffer)
-  (cleanup-buffer-safe)
-  (indent-buffer))
+  (soma-untabify-buffer)
+  (soma-cleanup-buffer-safe)
+  (soma-indent-buffer))
 ;;
 ;;------------------------------------------------------------------------
 
@@ -834,7 +838,7 @@ Including indent-buffer, which should not be called automatically on save."
                 (: string-start "/tmp/clipedit")
               )))
          (filtered-list
-           (remove-if
+           (cl-remove-if
              #'(lambda (name)
                  (string-match forbidden-files name))
              recentf-list)))
@@ -886,13 +890,11 @@ Including indent-buffer, which should not be called automatically on save."
     ;; so we want to use the native emacs clipboard sending feature instead.
     (if (display-graphic-p)
         ;; We are running in a gui emacs.
-        ;; Temporarily save the value of x-select-enable-clipboard,
-        ;; and restore it after using the native emacs clipboard sending
-        ;; feature.
-        (let ((old-x-select-enable-clipboard x-select-enable-clipboard))
-          (setf x-select-enable-clipboard 't)
-          (kill-new default-directory)
-          (setf x-select-enable-clipboard old-x-select-enable-clipboard))
+        ;; Temporarily enable select-enable-clipboard so that the native emacs
+        ;; clipboard sending feature is used.  The let binding restores the
+        ;; old value even if kill-new signals an error.
+        (let ((select-enable-clipboard t))
+          (kill-new default-directory))
       ;; We are *not* running in a gui emacs.
       (pcase system-type
         ('gnu/linux (xclip-set-selection 'primary default-directory))
@@ -916,13 +918,11 @@ Including indent-buffer, which should not be called automatically on save."
     ;; so we want to use the native emacs clipboard sending feature instead.
     (if (display-graphic-p)
         ;; We are running in a gui emacs.
-        ;; Temporarily save the value of x-select-enable-clipboard,
-        ;; and restore it after using the native emacs clipboard sending
-        ;; feature.
-        (let ((old-x-select-enable-clipboard x-select-enable-clipboard))
-          (setf x-select-enable-clipboard 't)
-          (kill-new default-directory)
-          (setf x-select-enable-clipboard old-x-select-enable-clipboard))
+        ;; Temporarily enable select-enable-clipboard so that the native emacs
+        ;; clipboard sending feature is used.  The let binding restores the
+        ;; old value even if kill-new signals an error.
+        (let ((select-enable-clipboard t))
+          (kill-new default-directory))
       ;; We are *not* running in a gui emacs.
       (xclip-set-selection 'primary default-directory))
     (message "Yanked the current directory to the X clipboard!")))
@@ -941,13 +941,11 @@ Including indent-buffer, which should not be called automatically on save."
     ;; so we want to use the native emacs clipboard sending feature instead.
     (if (display-graphic-p)
         ;; We are running in a gui emacs.
-        ;; Temporarily save the value of x-select-enable-clipboard,
-        ;; and restore it after using the native emacs clipboard sending
-        ;; feature.
-        (let ((old-x-select-enable-clipboard x-select-enable-clipboard))
-          (setf x-select-enable-clipboard 't)
-          (kill-new face-at-point)
-          (setf x-select-enable-clipboard old-x-select-enable-clipboard))
+        ;; Temporarily enable select-enable-clipboard so that the native emacs
+        ;; clipboard sending feature is used.  The let binding restores the
+        ;; old value even if kill-new signals an error.
+        (let ((select-enable-clipboard t))
+          (kill-new face-at-point))
       ;; We are *not* running in a gui emacs.
       (xclip-set-selection 'primary face-at-point))
     (message
@@ -1049,8 +1047,8 @@ If VARIABLE has a `custom-type' property, it must be a widget and the
 
 If given a prefix (or a COMMENT argument), also prompt for a comment."
   (interactive)
-  (cl-letf* (((symbol-function 'soma-utils--custom-prompt-variable)
-              (lambda (var prompt-val &optional comment)
+  (cl-flet ((soma-utils--custom-prompt-variable
+              (var prompt-val &optional comment)
                 "Prompt for a given variable's value and return
               both as a list.
               PROMPT-VAL is the prompt for the value.
@@ -1100,23 +1098,23 @@ If given a prefix (or a COMMENT argument), also prompt for a comment."
  	              (list var val
  	                    (read-string "Comment: " (get var 'variable-comment)))
                     (list var val)))))
-             (var-value-comment (soma-utils--custom-prompt-variable
-                                 variable
-                                 "Set customized value for %s to: "
-                                 current-prefix-arg))
-             (value (second var-value-comment))
-             (comment (third var-value-comment)))
-    (custom-load-symbol variable)
-    (custom-push-theme 'theme-value variable 'user 'set (custom-quote value))
-    (funcall (or (get variable 'custom-set) 'set-default) variable value)
-    (put variable 'customized-value (list (custom-quote value)))
-    (cond ((string= comment "")
-           (put variable 'variable-comment nil)
-           (put variable 'customized-variable-comment nil))
-          (comment
-           (put variable 'variable-comment comment)
-           (put variable 'customized-variable-comment comment)))
-    value))
+    (let* ((var-value-comment (soma-utils--custom-prompt-variable
+                               variable
+                               "Set customized value for %s to: "
+                               current-prefix-arg))
+           (value (cl-second var-value-comment))
+           (comment (cl-third var-value-comment)))
+      (custom-load-symbol variable)
+      (custom-push-theme 'theme-value variable 'user 'set (custom-quote value))
+      (funcall (or (get variable 'custom-set) 'set-default) variable value)
+      (put variable 'customized-value (list (custom-quote value)))
+      (cond ((string= comment "")
+             (put variable 'variable-comment nil)
+             (put variable 'customized-variable-comment nil))
+            (comment
+             (put variable 'variable-comment comment)
+             (put variable 'customized-variable-comment comment)))
+      value)))
     ;;
 ;;------------------------------------------------------------------------
 
@@ -1189,44 +1187,10 @@ If given a prefix (or a COMMENT argument), also prompt for a comment."
                             (org-table-convert-region (point-min) (point-max))
                             (org-mode)
                             (goto-char (point-min))
-                            (dotimes (i (count-lines (point-min) (point-max)))
+                            (dotimes (_ (count-lines (point-min) (point-max)))
                               (org-table-hline-and-move))
                             (delete-region (line-beginning-position) (line-end-position))
-                            (previous-line)
-                            (let ((current-line-contents
-                                  (buffer-substring-no-properties
-                                   (line-beginning-position)
-                                   (line-end-position))))
-                              (goto-char (point-min))
-                              (insert current-line-contents)
-                              (insert "\n"))
-                            (buffer-string))))
-      (delete-region start end)
-      (goto-char start)
-      (insert modified-text))))
-
-;;
-;;------------------------------------------------------------------------
-
-;;------------------------------------------------------------------------
-;;
-
-(defun soma--convert-tab-separated-table-to-org-format ()
-  "Convert a TAB-separated table to org-mode table format"
-  (interactive)
-  (when (region-active-p)
-    (let* ((start (region-beginning))
-           (end (region-end))
-           (region-contents (buffer-substring-no-properties start end))
-           (modified-text (with-temp-buffer
-                            (insert region-contents)
-                            (org-table-convert-region (point-min) (point-max))
-                            (org-mode)
-                            (goto-char (point-min))
-                            (dotimes (i (count-lines (point-min) (point-max)))
-                              (org-table-hline-and-move))
-                            (delete-region (line-beginning-position) (line-end-position))
-                            (previous-line)
+                            (forward-line -1)
                             (let ((current-line-contents
                                   (buffer-substring-no-properties
                                    (line-beginning-position)
@@ -1246,9 +1210,11 @@ If given a prefix (or a COMMENT argument), also prompt for a comment."
 ;;
 
 (defun soma--paste-from-x-without-backquotes-wrapping ()
-  "LLMs like to wrap their commit messages in fences made of three backquotes like ```
-This function will paste from X after removing the backquote wrapping
-and anything outside of them.
+  "Paste from X after removing the surrounding backquote fences.
+
+LLMs like to wrap their commit messages in fences made of three
+backquotes like ```.  This function will paste from X after removing
+the backquote wrapping and anything outside of them.
 
 For example, if the X selection contains:
 
@@ -1329,7 +1295,5 @@ foo"
 
 ;;
 ;;------------------------------------------------------------------------
-
-(provide 'soma-utils)
 
 (provide 'soma-utils)
